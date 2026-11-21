@@ -7,7 +7,9 @@ readonly bootstrap=1cfc9ea4d696de3d8c1a633e8e537f9bdd219aa7
 readonly messaging=112c254accdc3d34250f86561787d560f18bc9db
 readonly tests=df34e2004ada66e4d3f2283d3f8351eff43a3ab8
 readonly old_driver=b88dc37e33d744887ca3f4eb5daa0eeb76ed242a
-readonly candidate=2269446689318a13639ca45471224ace96503d23
+readonly original_candidate=2269446689318a13639ca45471224ace96503d23
+readonly realtime_candidate=9a7f6ba7746312cd8f08f178f0fb23304eef04f4
+readonly candidate=871007f3883b29e6767e1b93789132caae866833
 readonly vault=scripts/.messaging-dispatch
 readonly -a vendored=(
   scripts/ci-isolated-docker.sh scripts/ci-docker-admission.mjs
@@ -45,16 +47,9 @@ fetch_source() {
   umask 077
   [[ ! -e "$store" && ! -L "$store" ]] || blocked source-store
   git init --bare --quiet --template= "$store"
-  export GIT_CONFIG_COUNT=0
-  if [[ -n "${CARECONNECT_APP_CONTENTS_READ:-}" ]]; then
-    # Git reads the optional cross-repo credential from process environment only.
-    GIT_CONFIG_VALUE_0=$(printf 'x-access-token:%s' "$CARECONNECT_APP_CONTENTS_READ" | base64 -w0)
-    GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $GIT_CONFIG_VALUE_0"
-    export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$app_repository.extraHeader" GIT_CONFIG_VALUE_0
-  fi
-  unset CARECONNECT_APP_CONTENTS_READ
-  timeout --signal=TERM --kill-after=5s 3m \
-    git -C "$store" -c protocol.allow=never -c protocol.https.allow=always \
+  env -i PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_TERMINAL_PROMPT=0 timeout --signal=TERM --kill-after=5s 3m \
+    git -C "$store" -c credential.helper= -c protocol.allow=never -c protocol.https.allow=always \
     -c http.followRedirects=false fetch --quiet --no-tags --no-recurse-submodules \
     "$app_repository" "$candidate:refs/heads/reviewed-candidate" >/dev/null 2>&1 ||
     blocked source-fetch
@@ -64,18 +59,25 @@ fetch_source() {
 verify_candidate() {
   local repo=$1 delta path
   [[ "$(git -C "$repo" rev-parse --verify "$candidate^{commit}")" == "$candidate" ]] || blocked candidate
-  [[ "$(git -C "$repo" rev-list --parents -n 1 "$candidate")" == "$candidate $old_driver" &&
+  [[ "$(git -C "$repo" rev-list --parents -n 1 "$candidate")" == "$candidate $realtime_candidate" &&
+     "$(git -C "$repo" rev-list --parents -n 1 "$realtime_candidate")" == "$realtime_candidate $original_candidate" &&
+     "$(git -C "$repo" rev-list --parents -n 1 "$original_candidate")" == "$original_candidate $old_driver" &&
      "$(git -C "$repo" rev-list --parents -n 1 "$old_driver")" == "$old_driver $tests" &&
      "$(git -C "$repo" rev-list --parents -n 1 "$tests")" == "$tests $messaging" &&
      "$(git -C "$repo" rev-list --parents -n 1 "$messaging")" == "$messaging $bootstrap" ]] || blocked parent-chain
   git -C "$repo" merge-base --is-ancestor "$supervisor" "$messaging" || blocked approved-ancestry
   [[ "$(git -C "$repo" rev-list --count "$supervisor..$messaging")" == 18 &&
-     "$(git -C "$repo" rev-list --count "$supervisor..$candidate")" == 21 &&
+     "$(git -C "$repo" rev-list --count "$supervisor..$candidate")" == 23 &&
      "$(git -C "$repo" rev-list --count --merges "$supervisor..$candidate")" == 0 ]] || blocked unexpected-history
 
-  delta=$(git -C "$repo" diff --no-renames --name-status "$old_driver" "$candidate")
+  delta=$(git -C "$repo" diff --no-renames --name-status "$old_driver" "$original_candidate")
   [[ "$delta" == $'D\t.github/workflows/messaging-disposable-verification.yml' ]] || blocked driver-removal
-  git -C "$repo" diff --quiet "$tests" "$candidate" -- "${app_paths[@]}" || blocked application-or-test-tree
+  delta=$(git -C "$repo" diff --no-renames --name-status "$original_candidate" "$realtime_candidate")
+  [[ "$delta" == $'M\tscripts/real-service-integration.mjs\nM\tscripts/real-service-integration.test.mjs' ]] ||
+    blocked realtime-test-tree
+  delta=$(git -C "$repo" diff --no-renames --name-status "$realtime_candidate" "$candidate")
+  [[ "$delta" == $'M\tscripts/staging-reconciliation-rehearsal.test.mjs' ]] || blocked publication-test-tree
+  git -C "$repo" diff --quiet "$tests" "$original_candidate" -- "${app_paths[@]}" || blocked application-or-test-tree
   git -C "$repo" diff --quiet "$supervisor" "$candidate" -- "${fixture_paths[@]}" ||
     blocked fixture-tree
   git -C "$repo" diff --quiet "$bootstrap" "$candidate" -- \
@@ -104,8 +106,11 @@ prepare() {
     tar -xf - -C workspace
   for file in "${vendored[@]}"; do
     [[ -f "$file" && ! -L "$file" ]] || blocked supervisor-file
-    git -C "$store" cat-file blob "$supervisor:$file" | cmp -s - "$file" ||
-      blocked supervisor-baseline
+    case "$file" in
+      scripts/ci-isolated-docker.sh|scripts/ci-real-service-phase.sh) ;;
+      *) git -C "$store" cat-file blob "$supervisor:$file" | cmp -s - "$file" ||
+           blocked supervisor-baseline ;;
+    esac
     install -m 0644 "$file" "workspace/$file"
   done
   (
@@ -121,28 +126,16 @@ prepare() {
   git -C "$store" bundle create "$control/workspace/$vault/candidate.bundle" refs/heads/reviewed-candidate
   [[ "$(git bundle list-heads "workspace/$vault/candidate.bundle")" == "$candidate refs/heads/reviewed-candidate" ]] ||
     blocked bundle-head
-  mv workspace/scripts/ci-real-service-phase.sh "workspace/$vault/phase.sh"
-  install -m 0600 .github/ci/messaging-dispatch.sh "workspace/$vault/dispatch.sh"
-  cat > workspace/scripts/ci-real-service-phase.sh <<'BASH'
-#!/bin/bash
-set -euo pipefail
-vault=scripts/.messaging-dispatch
-if [[ "$1" == test ]]; then
-  /bin/bash "$vault/dispatch.sh" activate
-fi
-exec /bin/bash "$vault/phase.sh" "$@"
-BASH
-  bash -n workspace/scripts/ci-real-service-phase.sh
   printf '{"workflow_sha":"%s","candidate_sha":"%s","test_patch_sha":"%s","supervisor_sha":"%s"}\n' \
     "$GITHUB_WORKFLOW_SHA" "$candidate" "$tests" "$supervisor" > workspace/test-artifacts/messaging-source.json
 }
 
-activate() {
-  # The unchanged supervisor enters test only after live canaries, binding
-  # checks and egress removal. Check its receipt again before local Git import.
-  node scripts/service-execution-boundary.mjs check
-  local objects="${RUNNER_TEMP:?}/messaging-candidate.git" bundle
-  bundle="$(pwd -P)/$vault/candidate.bundle"
+extract_candidate() {
+  # Invoked from the sealed root control only, after the supervisor verifies
+  # the live receipt and removes egress. This phase reads Git data only.
+  local bundle=$1 dest=$2 objects=$3
+  [[ "$(id -u)" == 0 && -d "$dest" && ! -L "$dest" && "$(stat -c %u "$dest")" == 0 ]] ||
+    blocked extraction-owner
   umask 077
   [[ -f "$bundle" && ! -L "$bundle" && ! -e "$objects" && ! -L "$objects" ]] || blocked object-store
   git init --bare --quiet --template= "$objects"
@@ -151,14 +144,12 @@ activate() {
   [[ "$(git -C "$objects" rev-parse FETCH_HEAD)" == "$candidate" ]] || blocked fetched-object
   verify_candidate "$objects"
   umask 022
-  git -C "$objects" archive "$candidate" -- "${app_paths[@]}" | tar -xf - -C .
-  printf '{"status":"activated_after_isolation","candidate_sha":"%s"}\n' "$candidate" \
-    > test-artifacts/messaging-activation.json
+  git -C "$objects" archive "$candidate" -- "${app_paths[@]}" | tar -xf - -C "$dest"
 }
 
 case "${1:-}" in
   fetch) fetch_source ;;
   prepare) prepare ;;
-  activate) activate ;;
+  extract) shift; [[ $# == 3 ]] || blocked arguments; extract_candidate "$@" ;;
   *) blocked phase ;;
 esac

@@ -8,12 +8,15 @@ unset DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG DOCKER_TLS_VERIFY DOCKER_CERT_PAT
 
 blocked() { printf 'Service isolation BLOCKED (%s).\n' "$stage" >&2; exit 78; }
 stage=runner-identity
-[[ ( $# == 7 || $# == 8 ) && "$(id -u)" == 0 && "$1" =~ ^[0-9]{1,20}-[0-9]{1,6}$ ]] || blocked
+[[ $# == 9 && "$(id -u)" == 0 && "$1" =~ ^[0-9]{1,20}-[0-9]{1,6}$ ]] || blocked
 run=$1 uid=$2 gid=$3 workspace=$4 node=$5 supabase=$6 browser_cache=$7
-mode=${8:-real-service}
-[[ "$mode" == real-service || "$mode" == reconciliation ]] || blocked
+sealed=$8 candidate_uid=$9
+mode=real-service
 [[ "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ && "$uid" != 0 && "${SUDO_UID:-}" == "$uid" && "${SUDO_GID:-}" == "$gid" ]] || blocked
-[[ "$workspace" == "$(realpath -- "$workspace")" && "$(stat -c %u -- "$workspace")" == "$uid" ]] || blocked
+[[ "$sealed" =~ ^/var/tmp/careconnect-control[.][a-zA-Z0-9]{8}$ &&
+   "$sealed" == "$(realpath -- "$sealed")" && "$(stat -c %u:%a -- "$sealed")" == 0:711 &&
+   "$workspace" == "$sealed/workspace" && "$(stat -c %u:%a -- "$workspace")" == 0:755 &&
+   "$candidate_uid" =~ ^61[0-9]{3}$ && "$uid" != "$candidate_uid" ]] || blocked
 for bin in "$node" "$supabase"; do
   [[ "$bin" == /* && -f "$bin" && -x "$bin" ]] || blocked
 done
@@ -398,6 +401,15 @@ if (( rc == 0 )); then
     routes6=$(ip -n "$ns" -6 route show default 2>/dev/null) &&
     [[ -z "$routes4" && -z "$routes6" ]] && ! ip -n "$ns" link show tap0 >/dev/null 2>&1; then
     user_phase test || rc=$?
+    if (( rc == 0 )); then
+      # The candidate never runs under the startup/cleanup identity or in the
+      # workspace supplying the daemon's admission policy.
+      user_phase check || rc=$?
+      if (( rc == 0 )); then
+        ip netns exec "$ns" /bin/bash "$sealed/control/.github/ci/candidate-sandbox.sh" \
+          run "$sealed" "$root" "$uid" "$gid" "$candidate_uid" "$run" || rc=$?
+      fi
+    fi
   else
     printf 'Service integration BLOCKED (cannot verify egress removal or pgTAP preload).\n' >&2
     rc=78

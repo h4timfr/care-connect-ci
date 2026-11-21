@@ -84,7 +84,9 @@ case "$1" in
     node scripts/run-sql-ci-step.mjs ledger
     node scripts/run-sql-ci-step.mjs pgtap
     node scripts/run-sql-ci-step.mjs concurrency
-    timeout --signal=TERM --kill-after=15s 35m node scripts/real-service-integration.mjs run
+    ;;
+  check)
+    node scripts/service-execution-boundary.mjs check
     ;;
   pgtap-run)
     node scripts/service-execution-boundary.mjs check

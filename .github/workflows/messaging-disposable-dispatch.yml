@@ -12,15 +12,18 @@ concurrency:
 
 jobs:
   verify-messaging:
-    if: github.repository == 'h4timfr/care-connect-ci' && github.ref == 'refs/heads/main'
+    if: >-
+      github.repository == 'h4timfr/care-connect-ci' && github.ref == 'refs/heads/main' &&
+      github.actor == 'h4timfr' && github.triggering_actor == 'h4timfr'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - name: Require a manual run from protected CI main
+      - name: Require the owner and protected CI main
         shell: bash
         run: |
           set -euo pipefail
           [[ "$GITHUB_REPOSITORY" == h4timfr/care-connect-ci ]] || exit 78
+          [[ "$GITHUB_ACTOR" == h4timfr && "$GITHUB_TRIGGERING_ACTOR" == h4timfr ]] || exit 78
           [[ "$RUNNER_ENVIRONMENT" == github-hosted && "$RUNNER_OS" == Linux ]] || exit 78
           [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REF" == refs/heads/main &&
              "${GITHUB_REF_PROTECTED:-}" == true ]] || exit 78
@@ -36,8 +39,6 @@ jobs:
 
       - name: Fetch the allowlisted commit into a bare Git store
         shell: bash
-        env:
-          CARECONNECT_APP_CONTENTS_READ: ${{ secrets.CARECONNECT_APP_CONTENTS_READ }}
         run: bash .github/ci/messaging-dispatch.sh fetch
 
       - name: Verify approved hashes and prepare disposable inputs
@@ -76,23 +77,17 @@ jobs:
         run: node --test scripts/ci-docker-admission.test.mjs scripts/verify-disposable-docker-bindings.test.mjs
 
       - name: Prove isolation and run the pinned messaging candidate
-        working-directory: workspace
         shell: bash
         timeout-minutes: 75
         run: |
           set -euo pipefail
-          node scripts/real-service-integration.mjs verify-migrations
-          cmp -s ../scripts/ci-isolated-docker.sh scripts/ci-isolated-docker.sh || exit 78
-          cmp -s ../scripts/ci-docker-admission.mjs scripts/ci-docker-admission.mjs || exit 78
-          cmp -s ../scripts/ci-real-service-phase.sh scripts/.messaging-dispatch/phase.sh || exit 78
-          status=0
-          sudo -n /bin/bash ../scripts/ci-isolated-docker.sh \
-            "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" "$(id -u)" "$(id -g)" \
-            "$(pwd -P)" "$(command -v node)" "$(command -v supabase)" "$RUNNER_TEMP/careconnect-chromium" || status=$?
-          if [[ ! -f test-artifacts/service-execution-boundary.json && "$status" == 78 ]]; then
-            node scripts/service-execution-boundary.mjs
-          fi
-          exit "$status"
+          (cd workspace && node scripts/real-service-integration.mjs verify-migrations)
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_WORKFLOW_SHA" ]] || exit 78
+          git diff --no-ext-diff --quiet "$GITHUB_WORKFLOW_SHA" -- .github scripts || exit 78
+          sha256sum --check --strict .github/ci/trusted-control.sha256
+          sudo -n /bin/bash .github/ci/launch-protected.sh start \
+            "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" "$(pwd -P)" \
+            "$(command -v node)" "$(command -v supabase)" "$RUNNER_TEMP/careconnect-chromium"
 
       - name: Upload sanitized integration evidence
         if: always()
@@ -103,6 +98,7 @@ jobs:
           path: |
             workspace/test-artifacts/messaging-source.json
             workspace/test-artifacts/messaging-activation.json
+            workspace/test-artifacts/messaging-filesystem-proof.json
             workspace/test-artifacts/service-execution-boundary.json
             workspace/test-artifacts/docker-pre-start-proof.json
             workspace/test-artifacts/startup.log
