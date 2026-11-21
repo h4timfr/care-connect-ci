@@ -30,6 +30,18 @@ read_only_bind() {
   mount -o remount,bind,ro,nosuid,nodev "$target"
 }
 
+snapshot_service_inputs() {
+  local source=$1 output=$2
+  install -d -m 0755 "$output" "$output/.temp"
+  cp -a --reflink=auto "$source/migrations" "$source/tests" "$output/"
+  install -m 0444 "$source/config.toml" "$output/config.toml"
+  if [[ -f "$source/.temp/project-ref" && ! -L "$source/.temp/project-ref" ]]; then
+    install -m 0444 "$source/.temp/project-ref" "$output/.temp/project-ref"
+  fi
+  chown -hR 0:0 "$output"
+  chmod -R go+rX,go-w "$output"
+}
+
 enter() {
   local sealed=$1 jail=$2 root=$3 gid=$4 candidate=$5 run=$6 mode=$7 hidden=$8
   [[ "$(id -u)" == 0 && "$(stat -c %u:%a -- "$jail")" == 0:755 ]] || blocked jail-owner
@@ -42,6 +54,7 @@ enter() {
   done
   if [[ -d /etc/fonts ]]; then read_only_bind /etc/fonts "$jail/etc/fonts"; fi
   read_only_bind "$sealed/control" "$jail/control"
+  read_only_bind "$sealed/$mode-supabase" "$jail/work/supabase"
   mount -t proc -o nosuid,nodev,noexec proc "$jail/proc"
   for device in null zero full random urandom; do
     touch "$jail/dev/$device"
@@ -53,7 +66,6 @@ enter() {
     read_only_bind "$sealed/toolchain" "$jail/toolchain"
     read_only_bind "$sealed/browser" "$jail/browsers"
     read_only_bind "$sealed/candidate-scripts" "$jail/work/scripts"
-    read_only_bind "$sealed/workspace/supabase" "$jail/work/supabase"
     install -d -m 0711 "$jail$root"
     read_only_bind "$root/verified.json" "$jail$root/verified.json"
     read_only_bind "$root/docker-cli" "$jail$root/docker-cli"
@@ -107,6 +119,7 @@ run_candidate() {
     "$work/scripts/startup-evidence.mjs" "$sealed/candidate-scripts/"
   chmod -R go-w "$sealed/candidate-scripts"
   chown -hR "$candidate:$candidate" "$jail/work"
+  snapshot_service_inputs "$work/supabase" "$sealed/run-supabase"
   jail_exec "$sealed" "$jail" "$root" "$gid" "$candidate" "$run" run '' \
     </dev/null >"$sealed/candidate.raw" 2>&1 || status=$?
   # The PID namespace has terminated. Export only bounded regular artifacts
@@ -131,6 +144,10 @@ case "${1:-}" in
     [[ $# == 3 && "$(id -u)" == 0 ]] || blocked arguments
     sealed=$1 candidate=$2 hidden=$3
     new_jail "$sealed/probe-jail" "$candidate"
+    install -d -m 0700 "$sealed/probe-inputs"/{migrations,tests,.temp}
+    printf 'project_id = "synthetic-probe"\n' >"$sealed/probe-inputs/config.toml"
+    printf 'synthetic-probe\n' >"$sealed/probe-inputs/.temp/project-ref"
+    snapshot_service_inputs "$sealed/probe-inputs" "$sealed/probe-supabase"
     jail_exec "$sealed" "$sealed/probe-jail" '' "$candidate" "$candidate" 0-1 probe "$hidden"
     ;;
   *) blocked phase ;;

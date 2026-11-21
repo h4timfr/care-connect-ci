@@ -21,6 +21,10 @@ done
 if (printf 'probe\n' >/unlisted-write) 2>/dev/null; then exit 1; fi
 [[ ! -e /var/run/docker.sock && ! -e /run/containerd/containerd.sock && ! -e "$hidden" ]]
 printf 'PASS host sockets, unrelated runner files, and writes outside designated paths denied\n'
+[[ "$(< /work/supabase/config.toml)" == 'project_id = "synthetic-probe"' &&
+   "$(< /work/supabase/.temp/project-ref)" == synthetic-probe ]]
+if (printf 'probe\n' >>/work/supabase/config.toml) 2>/dev/null; then exit 1; fi
+printf 'PASS disposable service configuration readable and immutable\n'
 for dir in /work /artifacts /tmp /home/candidate /dev/shm; do
   printf 'probe\n' >"$dir/careconnect-probe"
   rm -- "$dir/careconnect-probe"
