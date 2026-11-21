@@ -1,0 +1,6 @@
+# The owner reviews the dispatcher, vendored supervisor, and integrity pins.
+* @h4timfr
+/.github/workflows/** @h4timfr
+/.github/ci/** @h4timfr
+/scripts/** @h4timfr
+/.github/CODEOWNERS @h4timfr

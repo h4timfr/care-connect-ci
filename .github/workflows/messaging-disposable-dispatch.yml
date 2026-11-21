@@ -1,0 +1,124 @@
+name: Trusted disposable messaging verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: careconnect-trusted-messaging-dispatch
+  cancel-in-progress: false
+
+jobs:
+  verify-messaging:
+    if: github.repository == 'h4timfr/care-connect-ci' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Require a manual run from protected CI main
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == h4timfr/care-connect-ci ]] || exit 78
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted && "$RUNNER_OS" == Linux ]] || exit 78
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REF" == refs/heads/main &&
+             "${GITHUB_REF_PROTECTED:-}" == true ]] || exit 78
+          [[ "$GITHUB_WORKFLOW_REF" == h4timfr/care-connect-ci/.github/workflows/messaging-disposable-dispatch.yml@refs/heads/main &&
+             "$GITHUB_WORKFLOW_SHA" == "$GITHUB_SHA" ]] || exit 78
+
+      - name: Check out trusted CI source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: h4timfr/care-connect-ci
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Fetch the allowlisted commit into a bare Git store
+        shell: bash
+        env:
+          CARECONNECT_APP_CONTENTS_READ: ${{ secrets.CARECONNECT_APP_CONTENTS_READ }}
+        run: bash .github/ci/messaging-dispatch.sh fetch
+
+      - name: Verify approved hashes and prepare disposable inputs
+        shell: bash
+        run: bash .github/ci/messaging-dispatch.sh prepare
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Install tools from the approved baseline lockfile
+        working-directory: workspace
+        run: npm ci --no-audit --no-fund
+
+      - name: Install pinned Supabase CLI
+        uses: supabase/setup-cli@45a513f8c64c0bc8e0e3dfe572b5c95be85f6359 # v3.0.1
+        with:
+          version: 2.117.0
+
+      - name: Install namespace transport and PostgreSQL client
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes slirp4netns postgresql-client
+
+      - name: Install Chromium from the approved lockfile
+        working-directory: workspace
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/careconnect-chromium
+        run: node node_modules/@playwright/test/cli.js install --with-deps chromium
+
+      - name: Validate approved admission and binding checks
+        working-directory: workspace
+        run: node --test scripts/ci-docker-admission.test.mjs scripts/verify-disposable-docker-bindings.test.mjs
+
+      - name: Prove isolation and run the pinned messaging candidate
+        working-directory: workspace
+        shell: bash
+        timeout-minutes: 75
+        run: |
+          set -euo pipefail
+          node scripts/real-service-integration.mjs verify-migrations
+          cmp -s ../scripts/ci-isolated-docker.sh scripts/ci-isolated-docker.sh || exit 78
+          cmp -s ../scripts/ci-docker-admission.mjs scripts/ci-docker-admission.mjs || exit 78
+          cmp -s ../scripts/ci-real-service-phase.sh scripts/.messaging-dispatch/phase.sh || exit 78
+          status=0
+          sudo -n /bin/bash ../scripts/ci-isolated-docker.sh \
+            "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" "$(id -u)" "$(id -g)" \
+            "$(pwd -P)" "$(command -v node)" "$(command -v supabase)" "$RUNNER_TEMP/careconnect-chromium" || status=$?
+          if [[ ! -f test-artifacts/service-execution-boundary.json && "$status" == 78 ]]; then
+            node scripts/service-execution-boundary.mjs
+          fi
+          exit "$status"
+
+      - name: Upload sanitized integration evidence
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: careconnect-ci-messaging-${{ github.run_id }}
+          path: |
+            workspace/test-artifacts/messaging-source.json
+            workspace/test-artifacts/messaging-activation.json
+            workspace/test-artifacts/service-execution-boundary.json
+            workspace/test-artifacts/docker-pre-start-proof.json
+            workspace/test-artifacts/startup.log
+            workspace/test-artifacts/startup-process.json
+            workspace/test-artifacts/startup-images-before.json
+            workspace/test-artifacts/startup-evidence.json
+            workspace/test-artifacts/startup-observer.json
+            workspace/test-artifacts/startup-observer-cleanup.json
+            workspace/test-artifacts/ledger.log
+            workspace/test-artifacts/pgtap.log
+            workspace/test-artifacts/concurrency.log
+            workspace/test-artifacts/real-service-summary.json
+            workspace/test-artifacts/browser-workflow-summary.json
+            workspace/test-artifacts/browser-failure-trace.json
+            workspace/test-artifacts/docker-network-summary.json
+            workspace/test-artifacts/docker-network-cleanup-summary.json
+            workspace/test-artifacts/docker-stop-summary.json
+          if-no-files-found: warn
+          retention-days: 7
