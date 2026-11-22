@@ -15,6 +15,8 @@
 
 Confirm the reported workflow, candidate, test patch, and supervisor identities. Require the filesystem proof, admission evidence, and loopback canary before startup. Check the verified service bindings, egress removal, and candidate activation. The expected inventory is 46 canonical migrations, 25 pgTAP files with 609 planned assertions, nine booking concurrency scenarios, and four browser workflows. The clinic case keeps its 120-second budget. Review direct socket delivery and reconnection alongside the browser tests. A healthy anonymous subscription may receive a row-free denial envelope, and must receive zero row events and have no access to the target rows. Require cleanup verification as part of accepting the run.
 
+The standalone checkout needs full history so the root bootstrap can verify the exact workflow commit against the reviewed control baseline. A bootstrap identity, manifest, or handoff error blocks candidate activation. Review the named failure category before retrying. In a dedicated Linux verification environment, `node --test scripts/ci-root-bootstrap.test.mjs` exercises the embedded bootstrap with synthetic Git objects and UID 65534. Run that test from a root session in the disposable environment.
+
 Require a passing network cleanup summary and teardown summary. A missing, malformed, or mismatched ownership record fails the run. The supervisor independently verifies zero containers and volumes and only the built-in Docker networks before stopping the private units. It then checks the unit states, namespace removal, and removal of run-owned filesystem state.
 
 ## Recover from a blocked or failed run

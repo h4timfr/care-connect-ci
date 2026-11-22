@@ -18,19 +18,37 @@ remove_seal() {
   owned_seal "$sealed" && rm -rf --one-file-system -- "$sealed" && [[ ! -e "$sealed" ]]
 }
 
-reviewed_copy() {
-  local manifest="$checkout/.github/ci/trusted-control.sha256" digest path
-  install -d -m 0755 "$sealed/control/.github/ci"
-  [[ -f "$manifest" && ! -L "$manifest" ]] || blocked control-manifest
-  install -m 0444 "$manifest" "$sealed/control/.github/ci/trusted-control.sha256"
-  while read -r digest path; do
-    [[ "$digest" =~ ^[0-9a-f]{64}$ &&
-      "$path" =~ ^(scripts|[.]github/ci)/[a-zA-Z0-9._-]+$ &&
-      -f "$checkout/$path" && ! -L "$checkout/$path" ]] || blocked control-entry
-    install -D -m 0444 "$checkout/$path" "$sealed/control/$path"
-  done <"$sealed/control/.github/ci/trusted-control.sha256"
-  (cd "$sealed/control" && sha256sum --check --strict .github/ci/trusted-control.sha256) ||
-    blocked control-digest
+verify_control() {
+  local manifest="$sealed/control/.github/ci/trusted-control.sha256"
+  owned_seal "$sealed" && [[ "$(stat -c %u:%a -- "$sealed")" == 0:711 &&
+    "$(realpath -- "${BASH_SOURCE[0]}")" == "$sealed/control/.github/ci/launch-protected.sh" &&
+    "$(stat -c %u:%a -- "$sealed/control")" == 0:555 &&
+    -f "$manifest" && ! -L "$manifest" && "$(stat -c %u:%a -- "$manifest")" == 0:444 &&
+    "$manifest_digest" =~ ^[a-f0-9]{64}$ ]] || blocked sealed-entry
+  printf '%s  %s\n' "$manifest_digest" "$manifest" | sha256sum --check --strict --quiet - ||
+    blocked sealed-manifest
+  (cd "$sealed/control" && sha256sum --check --strict --quiet .github/ci/trusted-control.sha256) ||
+    blocked sealed-control-digest
+}
+
+verify_workspace() {
+  local work="$sealed/workspace" file digest
+  for file in scripts supabase test-artifacts; do
+    [[ -d "$work/$file" && "$(realpath -- "$work/$file")" == "$work/$file" ]] ||
+      blocked workspace-alias
+  done
+  while read -r digest file; do
+    [[ -f "$work/$file" && "$(realpath -- "$work/$file")" == "$work/$file" &&
+       "$(stat -c %u:%h -- "$work/$file")" == 0:1 ]] || blocked workspace-alias
+  done <"$sealed/control/.github/ci/messaging-integrity.sha256"
+  (cd "$work" && sha256sum --check --strict "$sealed/control/.github/ci/messaging-integrity.sha256") ||
+    blocked workspace-digest
+  # Trusted phase code is installed from the sealed Git tree. The staged data
+  # must agree with it even though its copies are never used for execution.
+  for file in ci-isolated-docker.sh ci-docker-admission.mjs ci-real-service-phase.sh \
+      service-execution-boundary.mjs verify-disposable-docker-bindings.mjs; do
+    install -m 0444 "$sealed/control/scripts/$file" "$work/scripts/$file"
+  done
 }
 
 candidate_process_exists() {
@@ -50,39 +68,55 @@ reserve_identity() {
 }
 
 start() {
-  local run=$1 node=$3 cli=$4 browser=$5 uid
-  checkout=$2
+  sealed=$1 run=$2 checkout=$3 manifest_digest=$7
+  local node=$4 cli=$5 browser=$6 candidate_uid
+  verify_control
   [[ "$run" =~ ^[0-9]{1,20}-[0-9]{1,6}$ && "$checkout" == "$(realpath -- "$checkout")" &&
-     "$(stat -c %u "$checkout")" == "$runner_uid" && -d "$checkout/workspace/node_modules" ]] ||
+     "$(stat -c %u "$checkout")" == "$runner_uid" && ! -L "$checkout/workspace" &&
+     -d "$checkout/workspace/node_modules" ]] ||
     blocked checkout
   [[ -f "$node" && -x "$node" && -f "$cli" && -x "$cli" && -d "$browser" ]] || blocked tools
-  sealed=$(mktemp -d /var/tmp/careconnect-control.XXXXXXXX)
-  chmod 0711 "$sealed"
   trap 'status=$?; remove_seal || exit 1; exit "$status"' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  reviewed_copy
   install -d -m 0755 "$sealed/workspace"
   cp -a --reflink=auto "$checkout/workspace/." "$sealed/workspace/"
   chown -hR 0:0 "$sealed/workspace"
   chmod -R go-w "$sealed/workspace"
   chmod 0755 "$sealed/workspace"
-  (cd "$sealed/workspace" && sha256sum --check --strict "$sealed/control/.github/ci/messaging-integrity.sha256") ||
-    blocked workspace-digest
+  verify_workspace
   # The trusted startup identity needs generated Supabase state and evidence.
   # These paths are outside the candidate PID and mount namespaces.
   chown -hR "$runner_uid:$runner_gid" "$sealed/workspace/supabase" "$sealed/workspace/test-artifacts"
   install -d -m 0755 "$sealed/toolchain/bin" "$sealed/toolchain/lib/node_modules"
   install -m 0555 "$node" "$sealed/toolchain/bin/node"
   install -m 0555 "$cli" "$sealed/toolchain/bin/supabase"
+  # The supervisor invokes these two executables as root.
+  (
+    cd "$sealed/toolchain/bin"
+    sha256sum --check --strict --quiet <<'TOOLCHAIN'
+af8d5d1e234beb26b3095e6bebf80edc781f79c9435553a383037eccec2716f8  node
+40efbaffd04e4cbf501b4f29a52c88ca23f81c636ef211e3b255c4e7b81eeb01  supabase
+TOOLCHAIN
+  ) || blocked toolchain-digest
   cp -a --reflink=auto "$(dirname "$(realpath "$node")")/../lib/node_modules/npm" "$sealed/toolchain/lib/node_modules/npm"
   ln -s ../lib/node_modules/npm/bin/npm-cli.js "$sealed/toolchain/bin/npm"
   ln -s ../lib/node_modules/npm/bin/npx-cli.js "$sealed/toolchain/bin/npx"
   cp -a --reflink=auto "$browser" "$sealed/browser"
   chown -hR 0:0 "$sealed/toolchain" "$sealed/browser"
   chmod -R go-w "$sealed/toolchain" "$sealed/browser"
-  uid=$(reserve_identity) || blocked candidate-identity
-  exec /bin/bash "$sealed/control/.github/ci/launch-protected.sh" sealed "$sealed" "$checkout" "$run" "$uid"
+  candidate_uid=$(reserve_identity) || blocked candidate-identity
+  [[ "$candidate_uid" != "$runner_uid" ]] || blocked candidate-identity
+  verify_control
+  trap finish EXIT
+  /bin/bash "$sealed/control/.github/ci/candidate-sandbox.sh" probe \
+    "$sealed" "$candidate_uid" "$checkout/.github/ci/trusted-control.sha256" || blocked filesystem-probe
+  if candidate_process_exists "$candidate_uid"; then blocked descendant-cleanup; fi
+  printf '{"status":"PASS","candidate_uid":%s,"filesystem_probe":true}\n' "$candidate_uid" \
+    >"$sealed/workspace/test-artifacts/messaging-filesystem-proof.json"
+  /bin/bash "$sealed/control/scripts/ci-isolated-docker.sh" \
+    "$run" "$runner_uid" "$runner_gid" "$sealed/workspace" \
+    "$sealed/toolchain/bin/node" "$sealed/toolchain/bin/supabase" "$sealed/browser" "$sealed" "$candidate_uid"
 }
 
 finish() {
@@ -101,7 +135,9 @@ finish() {
       [[ -e "$input" || -L "$input" ]] || continue
       if [[ -f "$input" && ! -L "$input" && ! -L "$output/$file" &&
           "$(stat -c %s "$input")" -le 1048576 ]]; then
-        install -m 0600 -o "$runner_uid" -g "$runner_gid" "$input" "$output/$file" || status=1
+        # Resolve and open the mutable destination with only runner permissions.
+        setpriv --reuid="$runner_uid" --regid="$runner_gid" --clear-groups --no-new-privs \
+          /bin/bash -ec 'umask 077; cat >"$1"' careconnect "$output/$file" <"$input" || status=1
       else
         status=1
       fi
@@ -114,29 +150,7 @@ finish() {
 }
 
 case "${1:-}" in
-  start)
-    shift
-    [[ $# == 5 ]] || blocked arguments
-    start "$@"
-    ;;
-  sealed)
-    shift
-    [[ $# == 4 ]] || blocked arguments
-    sealed=$1 checkout=$2 run=$3 candidate_uid=$4
-    owned_seal "$sealed" && [[ "$(realpath "${BASH_SOURCE[0]}")" == "$sealed/control/.github/ci/launch-protected.sh" &&
-       "$run" =~ ^[0-9]{1,20}-[0-9]{1,6}$ && "$candidate_uid" =~ ^61[0-9]{3}$ &&
-       "$candidate_uid" != "$runner_uid" ]] || blocked sealed-entry
-    trap finish EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    /bin/bash "$sealed/control/.github/ci/candidate-sandbox.sh" probe \
-      "$sealed" "$candidate_uid" "$checkout/.github/ci/trusted-control.sha256" || blocked filesystem-probe
-    if candidate_process_exists "$candidate_uid"; then blocked descendant-cleanup; fi
-    printf '{"status":"PASS","candidate_uid":%s,"filesystem_probe":true}\n' "$candidate_uid" \
-      >"$sealed/workspace/test-artifacts/messaging-filesystem-proof.json"
-    /bin/bash "$sealed/control/scripts/ci-isolated-docker.sh" \
-      "$run" "$runner_uid" "$runner_gid" "$sealed/workspace" \
-      "$sealed/toolchain/bin/node" "$sealed/toolchain/bin/supabase" "$sealed/browser" "$sealed" "$candidate_uid"
-    ;;
+  start) [[ $# == 8 ]] || blocked arguments; shift; start "$@" ;;
+  verify) [[ $# == 3 ]] || blocked arguments; sealed=$2 manifest_digest=$3; verify_control ;;
   *) blocked arguments ;;
 esac

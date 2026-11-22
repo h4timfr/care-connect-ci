@@ -1,5 +1,5 @@
 571b62a88c245c671dd06d7a87d3cae5a9cc16ed4277ef60a42f49509115fa60  .github/ci/candidate-sandbox.sh
-5d5bd3b1529c21249ac8fbb51eba4bad78e99bb2b66b4a04b77c4d74cecd8299  .github/ci/launch-protected.sh
+6bd16296c31139f6c3250d677c48f2084a7bbd7d0b16c38dc1469b0010de6607  .github/ci/launch-protected.sh
 f04a9f4e2a9f71360088f75b4b2f53e3cac36051a198420ba735dc334d05e675  .github/ci/messaging-dispatch.sh
 8285f006551a3d305356bfd86a598793dd965772c785063b53c9816bf8348fa0  .github/ci/messaging-integrity.sha256
 9df3fb3289a8f143296de418d92ee2c850f8e8ec57f81436820699bd6834d9e7  .github/ci/sandbox-probe.sh

@@ -35,6 +35,7 @@ jobs:
         with:
           repository: h4timfr/care-connect-ci
           ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Fetch the allowlisted commit into a bare Git store
@@ -48,7 +49,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 22
+          node-version: 22.13.0
 
       - name: Install tools from the approved baseline lockfile
         working-directory: workspace
@@ -59,18 +60,26 @@ jobs:
         with:
           version: 2.117.0
 
-      - name: Install namespace transport and PostgreSQL client
+      - name: Install namespace, PostgreSQL, and Chromium system dependencies
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --yes slirp4netns postgresql-client
+          # Use the pinned Playwright Ubuntu 24.04 Chromium dependency list.
+          /usr/bin/sudo -n /usr/bin/apt-get update
+          /usr/bin/sudo -n /usr/bin/apt-get install --yes slirp4netns postgresql-client \
+            xvfb fonts-noto-color-emoji fonts-unifont libfontconfig1 libfreetype6 \
+            xfonts-cyrillic xfonts-scalable fonts-liberation fonts-ipafont-gothic \
+            fonts-wqy-zenhei fonts-tlwg-loma-otf fonts-freefont-ttf \
+            libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
+            libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64 \
+            libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
+            libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2
 
       - name: Install Chromium from the approved lockfile
         working-directory: workspace
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/careconnect-chromium
-        run: node node_modules/@playwright/test/cli.js install --with-deps chromium
+        run: node node_modules/@playwright/test/cli.js install chromium
 
       - name: Validate approved admission and binding checks
         working-directory: workspace
@@ -82,15 +91,130 @@ jobs:
       - name: Prove isolation and run the pinned messaging candidate
         shell: bash
         timeout-minutes: 75
+        env:
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
+          [[ "$(/usr/bin/git rev-parse HEAD)" == "$TRUSTED_WORKFLOW_SHA" ]] || exit 78
           (cd workspace && node scripts/real-service-integration.mjs verify-migrations)
-          [[ "$(git rev-parse HEAD)" == "$GITHUB_WORKFLOW_SHA" ]] || exit 78
-          git diff --no-ext-diff --quiet "$GITHUB_WORKFLOW_SHA" -- .github scripts || exit 78
-          sha256sum --check --strict .github/ci/trusted-control.sha256
-          sudo -n /bin/bash .github/ci/launch-protected.sh start \
-            "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" "$(pwd -P)" \
-            "$(command -v node)" "$(command -v supabase)" "$RUNNER_TEMP/careconnect-chromium"
+          bootstrap=$(/usr/bin/cat <<'ROOT_BOOTSTRAP'
+          set -euo pipefail
+          umask 077
+          blocked() { printf 'Root bootstrap BLOCKED (%s).\n' "$1" >&2; exit 78; }
+
+          [[ "$(id -u)" == 0 && "$SUDO_UID" =~ ^[1-9][0-9]*$ && "$SUDO_GID" =~ ^[0-9]+$ &&
+             "$CI_REPOSITORY" == h4timfr/care-connect-ci &&
+             "$CI_WORKFLOW_REF" == h4timfr/care-connect-ci/.github/workflows/messaging-disposable-dispatch.yml@refs/heads/main &&
+             "$CI_PROTECTED" == true && "$CI_EVENT" == workflow_dispatch &&
+             "$CI_OWNER" == h4timfr && "$CI_TRIGGER" == h4timfr &&
+             "$CI_REVISION" =~ ^[a-f0-9]{40}$ && "$CI_REVISION" == "$CI_DISPATCH" &&
+             "$CI_REVISION" == "$CI_CHECKED_OUT" ]] || blocked workflow-identity
+
+          readonly approved=8270499e883af9bc503c3b54289fcc6eba4bafb6
+          readonly approved_digest=48d9517f90645fe2281e546c5589f6a595575f78848661901beb75492c849f69
+          readonly active_digest=4e5b8c8ebb08ab72701460582cf8ebd237d14930bfa9ac9a7a7c97e4be4937ec
+          readonly manifest=.github/ci/trusted-control.sha256
+          readonly launcher=.github/ci/launch-protected.sh
+
+          cd /
+          sealed=$(mktemp -d /var/tmp/careconnect-control.XXXXXXXX)
+          cleanup() {
+            if [[ -e "$sealed" || -L "$sealed" ]]; then
+              [[ "$sealed" =~ ^/var/tmp/careconnect-control[.][A-Za-z0-9]{8}$ &&
+                ! -L "$sealed" && "$(realpath -- "$sealed")" == "$sealed" &&
+                "$(stat -c %u -- "$sealed")" == 0 ]] || return 1
+              rm -rf --one-file-system -- "$sealed"
+            fi
+          }
+          trap 'status=$?; cleanup || exit 1; exit "$status"' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          # Bootstrap from streamed Git objects. Git never opens the runner checkout as root.
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1
+          timeout 15s head -c 8388609 >"$sealed/source.bundle" || blocked bundle-read
+          size=$(stat -c %s -- "$sealed/source.bundle")
+          (( size > 0 && size <= 8388608 )) || blocked bundle-size
+          git init --quiet --bare --template= "$sealed/objects.git"
+          object_git() { git --git-dir="$sealed/objects.git" "$@"; }
+          [[ "$(object_git bundle list-heads "$sealed/source.bundle")" == "$CI_REVISION HEAD" ]] ||
+            blocked bundle-tip
+          object_git -c transfer.fsckObjects=true bundle unbundle "$sealed/source.bundle" >/dev/null 2>&1 ||
+            blocked git-bundle
+          object_git fsck --strict --no-dangling --no-reflogs "$approved" "$CI_REVISION" >/dev/null 2>&1 &&
+            object_git merge-base --is-ancestor "$approved" "$CI_REVISION" || blocked git-history
+
+          check_digest() {
+            printf '%s  %s\n' "$1" "$2" | sha256sum --check --strict --quiet - >/dev/null 2>&1
+          }
+          copy_blob() {
+            local revision=$1 file=$2 target=$3 entry metadata name
+            entry=$(object_git ls-tree "$revision" -- "$file") || blocked git-tree
+            IFS=$'\t' read -r metadata name <<<"$entry"
+            [[ "$metadata" =~ ^100644[[:space:]]blob[[:space:]][a-f0-9]{40}$ &&
+               "$name" == "$file" ]] || blocked git-file-mode
+            mkdir -p -- "$(dirname -- "$target/$file")"
+            object_git cat-file blob "$revision:$file" >"$target/$file" || blocked git-blob
+          }
+          seal_tree() {
+            local revision=$1 pin=$2 target=$3 digest file count=0
+            local -A seen=()
+            copy_blob "$revision" "$manifest" "$target"
+            check_digest "$pin" "$target/$manifest" || blocked manifest-digest
+            while read -r digest file; do
+              [[ "$digest" =~ ^[a-f0-9]{64}$ && "$file" =~ ^(scripts|[.]github/ci)/[a-zA-Z0-9._-]+$ &&
+                 "$file" != "$manifest" && -z "${seen[$file]+present}" ]] || blocked manifest-entry
+              seen["$file"]=1
+              copy_blob "$revision" "$file" "$target"
+              count=$((count + 1))
+            done <"$target/$manifest"
+            [[ "$count" == 10 && -n "${seen[$launcher]+present}" ]] || blocked manifest-count
+            (cd "$target"; sha256sum --check --strict --quiet "$manifest") || blocked control-digest
+            find "$target" -type f -exec chmod 0444 {} +
+            find "$target" -type d -exec chmod 0555 {} +
+          }
+
+          seal_tree "$approved" "$approved_digest" "$sealed/approved"
+          seal_tree "$CI_REVISION" "$active_digest" "$sealed/control"
+          while read -r digest file; do
+            if [[ "$file" != "$launcher" ]]; then
+              cmp -s "$sealed/approved/$file" "$sealed/control/$file" || blocked unexpected-control-change
+            fi
+          done <"$sealed/approved/$manifest"
+          chmod 0711 "$sealed"
+
+          # A dirty checkout blocks the run, and is inspected with runner permissions.
+          # Subsequent changes to its control files cannot affect the sealed copy.
+          setpriv --reuid="$SUDO_UID" --regid="$SUDO_GID" --clear-groups --no-new-privs \
+            /bin/bash -ec '
+              cd -- "$1"
+              [[ -f "$2" && ! -L "$2" ]]
+              printf "%s  %s\n" "$3" "$2" | sha256sum --check --strict --quiet -
+              sha256sum --check --strict --quiet "$4/$2"
+            ' careconnect "$2" "$manifest" "$active_digest" "$sealed/control" >/dev/null 2>&1 ||
+              blocked checkout-control-changed
+
+          # Recheck the root-owned handoff immediately before invoking a shell file.
+          unexpected=$(find "$sealed/control" \( ! -uid 0 -o \
+            \( -type f ! -perm 0444 \) -o \( -type d ! -perm 0555 \) -o \
+            \( ! -type f ! -type d \) \) -print -quit) || blocked sealed-control-metadata
+          [[ -z "$unexpected" && "$(find "$sealed/control" -type f -printf . | wc -c)" == 11 ]] ||
+            blocked sealed-control-metadata
+          check_digest "$active_digest" "$sealed/control/$manifest" &&
+            (cd "$sealed/control"; sha256sum --check --strict --quiet "$manifest") || blocked sealed-control-changed
+          /bin/bash "$sealed/control/$launcher" start "$sealed" "$@" "$active_digest"
+          ROOT_BOOTSTRAP
+          )
+          /usr/bin/git --no-replace-objects bundle create - HEAD |
+            /usr/bin/sudo -n /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+              "SUDO_UID=$(/usr/bin/id -u)" "SUDO_GID=$(/usr/bin/id -g)" \
+              "CI_REVISION=$TRUSTED_WORKFLOW_SHA" "CI_DISPATCH=$GITHUB_SHA" "CI_CHECKED_OUT=$GITHUB_WORKFLOW_SHA" \
+              "CI_REPOSITORY=$GITHUB_REPOSITORY" "CI_WORKFLOW_REF=$GITHUB_WORKFLOW_REF" \
+              "CI_PROTECTED=$GITHUB_REF_PROTECTED" "CI_EVENT=$GITHUB_EVENT_NAME" \
+              "CI_OWNER=$GITHUB_ACTOR" "CI_TRIGGER=$GITHUB_TRIGGERING_ACTOR" \
+              /bin/bash --noprofile --norc -c "$bootstrap" careconnect \
+                "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" "$(pwd -P)" \
+                "$(command -v node)" "$(command -v supabase)" "$RUNNER_TEMP/careconnect-chromium"
 
       - name: Upload sanitized integration evidence
         if: always()
