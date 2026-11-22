@@ -107,7 +107,7 @@ prepare() {
   for file in "${vendored[@]}"; do
     [[ -f "$file" && ! -L "$file" ]] || blocked supervisor-file
     case "$file" in
-      scripts/ci-isolated-docker.sh|scripts/ci-real-service-phase.sh) ;;
+      scripts/ci-isolated-docker.sh|scripts/ci-real-service-phase.sh|scripts/ci-docker-admission.mjs|scripts/verify-disposable-docker-bindings.mjs) ;;
       *) git -C "$store" cat-file blob "$supervisor:$file" | cmp -s - "$file" ||
            blocked supervisor-baseline ;;
     esac

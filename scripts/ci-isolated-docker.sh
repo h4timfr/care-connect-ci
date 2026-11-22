@@ -44,12 +44,22 @@ net_created=0
 plugin_started=0
 slirp_started=0
 daemon_started=0
+engine_verified=0
 socket="unix://$root/engine.sock"
 plugin_dir="$root/plugins"
+record="$root/ownership/network.json"
 d() { timeout 90s /usr/bin/docker --config "$root/docker-cli" --host "$socket" "$@"; }
 empty_containers() {
   local ids
   ids=$(d ps -aq 2>/dev/null) && [[ -z "$ids" ]]
+}
+
+empty_engine_resources() {
+  local networks volumes
+  empty_containers &&
+    networks=$(d network ls --format '{{.Name}}' 2>/dev/null | sort | paste -sd,) &&
+    [[ "$networks" == host,none ]] &&
+    volumes=$(d volume ls -q 2>/dev/null) && [[ -z "$volumes" ]]
 }
 
 stop_owned_unit() {
@@ -61,34 +71,49 @@ stop_owned_unit() {
 }
 
 stop_units() {
-  local rc=$? cleanup_rc=0
+  local rc=$? teardown_rc=0 inventory=NOT_EVALUATED
+  local units_stopped=true namespace_absent=false filesystem_removed=false unit active pid
   trap - EXIT
   set +e
-  if (( daemon_started )); then stop_owned_unit "$daemon_unit" || cleanup_rc=1; fi
-  if (( plugin_started )); then stop_owned_unit "$plugin_unit" || cleanup_rc=1; fi
-  if (( slirp_started )); then stop_owned_unit "$slirp_unit" || cleanup_rc=1; fi
+  if (( engine_verified )); then
+    if empty_engine_resources; then inventory=PASS; else inventory=FAIL; fi
+  fi
+  if (( daemon_started )); then stop_owned_unit "$daemon_unit" || units_stopped=false; fi
+  if (( plugin_started )); then stop_owned_unit "$plugin_unit" || units_stopped=false; fi
+  if (( slirp_started )); then stop_owned_unit "$slirp_unit" || units_stopped=false; fi
+  for unit in "$daemon_unit" "$plugin_unit" "$slirp_unit"; do
+    if ! active=$(systemctl show --property=ActiveState --value "$unit" 2>/dev/null) ||
+       ! pid=$(systemctl show --property=MainPID --value "$unit" 2>/dev/null) ||
+       [[ "$active" != inactive && "$active" != failed ]] || [[ "$pid" != 0 ]]; then
+      units_stopped=false
+    fi
+  done
   if (( net_created )); then
     local remaining
-    if ! remaining=$(ip netns pids "$ns" 2>/dev/null) || [[ -n "$remaining" ]]; then
-      cleanup_rc=1
-    else
-      ip netns delete "$ns" >/dev/null 2>&1 || cleanup_rc=1
-      [[ ! -e "/run/netns/$ns" ]] || cleanup_rc=1
+    if remaining=$(ip netns pids "$ns" 2>/dev/null) && [[ -z "$remaining" ]] &&
+       ip netns delete "$ns" >/dev/null 2>&1; then
+      [[ ! -e "/run/netns/$ns" && ! -L "/run/netns/$ns" ]] && namespace_absent=true
     fi
+  elif [[ ! -e "/run/netns/$ns" && ! -L "/run/netns/$ns" ]]; then
+    namespace_absent=true
   fi
-  for unit in "$daemon_unit" "$plugin_unit" "$slirp_unit"; do
-    if systemctl is-active --quiet "$unit"; then cleanup_rc=1; fi
-  done
-  if (( cleanup_rc == 0 )); then
-    if [[ "$root" =~ ^/var/tmp/careconnect-ci\.[a-zA-Z0-9]{8}$ && ! -L "$root" && "$(stat -c %u -- "$root")" == 0 && "$(realpath -- "$root")" == "$root" ]]; then
-      rm -rf --one-file-system -- "$root" || cleanup_rc=1
-      [[ ! -e "$root" ]] || cleanup_rc=1
-    else
-      cleanup_rc=1
-    fi
+  if [[ "$units_stopped" == true && "$namespace_absent" == true &&
+        "$root" =~ ^/var/tmp/careconnect-ci\.[a-zA-Z0-9]{8}$ && ! -L "$root" &&
+        "$(stat -c %u -- "$root")" == 0 && "$(realpath -- "$root")" == "$root" ]] &&
+     rm -rf --one-file-system -- "$root" && [[ ! -e "$root" && ! -L "$root" ]]; then
+    filesystem_removed=true
   fi
-  if (( cleanup_rc )); then
-    printf 'Private daemon shutdown or resource removal failed.\n' >&2
+  if [[ "$inventory" == FAIL || "$units_stopped" != true || "$namespace_absent" != true ||
+        "$filesystem_removed" != true ]] || { (( rc == 0 )) && [[ "$inventory" != PASS ]]; }; then
+    teardown_rc=1
+  fi
+  local status=PASS
+  if (( teardown_rc )); then status=FAIL; fi
+  printf '{"status":"%s","engine_inventory":"%s","private_units_stopped":%s,"namespace_absent":%s,"filesystem_removed":%s}\n' \
+    "$status" "$inventory" "$units_stopped" "$namespace_absent" "$filesystem_removed" \
+    >"$workspace/test-artifacts/docker-teardown-summary.json" || teardown_rc=1
+  if (( teardown_rc )); then
+    printf 'Private Docker cleanup verification failed.\n' >&2
     exit 1
   fi
   printf 'Private daemon, egress process, namespace and run state removed.\n'
@@ -98,11 +123,11 @@ trap stop_units EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 chmod 0711 "$root"
-mkdir "$plugin_dir" "$root/docker-cli" "$root/state" "$root/home"
+mkdir "$plugin_dir" "$root/docker-cli" "$root/ownership" "$root/evidence" "$root/cli-tmp" "$root/home"
 chmod 0700 "$plugin_dir"
 chmod 0755 "$root/docker-cli"
-chown "$uid:$gid" "$root/state" "$root/home"
-chmod 0700 "$root/state" "$root/home"
+chown "$uid:$gid" "$root/ownership" "$root/evidence" "$root/cli-tmp" "$root/home"
+chmod 0700 "$root/ownership" "$root/evidence" "$root/cli-tmp" "$root/home"
 printf 'nameserver 10.0.2.3\n' >"$root/resolv.conf"
 printf '{}\n' >"$root/daemon.json"
 
@@ -203,6 +228,7 @@ empty_containers || blocked
 volumes=$(d volume ls -q 2>/dev/null) || blocked
 [[ -z "$volumes" ]] || blocked
 [[ "$(d network ls --format '{{.Name}}' | sort | paste -sd,)" == host,none ]] || blocked
+engine_verified=1
 
 cd -- "$workspace"
 user_phase() {
@@ -214,7 +240,7 @@ user_phase() {
     exec "$@"
   ' careconnect setpriv --reuid="$uid" --regid="$gid" --clear-groups --no-new-privs \
     env -i "PATH=$(dirname "$node"):$(dirname "$supabase"):/usr/bin:/bin" "HOME=$root/home" \
-    "RUNNER_TEMP=$root/state" "TMPDIR=$root/state" DO_NOT_TRACK=1 "PLAYWRIGHT_BROWSERS_PATH=$browser_cache" \
+    "RUNNER_TEMP=$root/evidence" "TMPDIR=$root/cli-tmp" DO_NOT_TRACK=1 "PLAYWRIGHT_BROWSERS_PATH=$browser_cache" \
     CI=true GITHUB_ACTIONS=true "GITHUB_RUN_ID=${run%-*}" "GITHUB_RUN_ATTEMPT=${run##*-}" \
     "DOCKER_HOST=$socket" "DOCKER_CONFIG=$root/docker-cli" "CARECONNECT_ISOLATION_ROOT=$root" \
     "CARECONNECT_DOCKER_NETWORK=$project" "CARECONNECT_DOCKER_RUN_LABEL=$run" \
@@ -225,6 +251,12 @@ printf '{"project":"%s","namespace":"%s","engine":"%s","policy":"careconnect-ci-
 chmod 0444 "$root/provisioned.json"
 stage=network-policy
 user_phase prepare || blocked
+[[ -f "$record" && ! -L "$record" && "$(stat -c %u:%h -- "$record")" == "$uid:1" ]] || blocked
+chown "0:$gid" "$root/ownership" "$record"
+chmod 0750 "$root/ownership"
+chmod 0440 "$record"
+# The unchanged, pinned startup observer reads this legacy location.
+ln -s "$record" "$root/evidence/careconnect-docker-network-owned.json"
 empty_containers || blocked
 stage=live-admission-controls
 # This pinned non-Supabase canary is used before any Supabase container.
@@ -234,6 +266,13 @@ for binding in '0.0.0.0:48480:8080' '10.0.2.100:48480:8080' '[::]:48480:8080'; d
   if d create --network "$project" --publish "$binding" "$canary" true >"$root/canary.raw" 2>&1; then blocked; fi
   grep -Fq 'careconnect-admission-denied' "$root/canary.raw" || blocked
   empty_containers || blocked
+done
+for source in "$record" "$root/evidence" "$root/cli-tmp"; do
+  for access in ro rw; do
+    if d create --network "$project" --volume "$source:/probe:$access" "$canary" true >"$root/canary.raw" 2>&1; then blocked; fi
+    grep -Fq 'careconnect-admission-denied' "$root/canary.raw" || blocked
+    empty_containers || blocked
+  done
 done
 if d create --network host "$canary" true >"$root/canary.raw" 2>&1; then blocked; fi
 grep -Fq 'careconnect-admission-denied' "$root/canary.raw" || blocked
@@ -261,7 +300,8 @@ printf '%s\n' "$image_metadata" | "$node" --input-type=module -e '
 ' "$driver" 2>/dev/null || blocked
 
 stage=canary-filesystem
-probe=$(d create --network "$project" -p 48480:8080 "$canary" /bin/busybox httpd -f -p 8080) || blocked
+probe=$(d create --network "$project" -p 48480:8080 --volume "$workspace/supabase/tests:/tests:ro" \
+  "$canary" /bin/busybox httpd -f -p 8080) || blocked
 [[ "$probe" =~ ^[a-f0-9]{64}$ ]] || blocked
 if ! d export --output "$root/canary.tar" "$probe" ||
    ! tar -tf "$root/canary.tar" >"$root/canary-files.raw"; then
@@ -384,9 +424,9 @@ empty_containers || blocked
 printf '{"project":"%s","namespace":"%s","engine":"%s","policy":"careconnect-ci-admission"}\n' \
   "$project" "$net_inode" "$engine_id" >"$root/verified.json"
 chmod 0444 "$root/verified.json"
-printf '{"status":"PASS","denied_before_create":["ipv4-wildcard","ipv4-non-loopback","ipv6-wildcard","host-network"],"published_canary":"127.0.0.1","outer_ipv4_reachable":false,"outer_ipv6_reachable":false,"tap_ipv4_reachable":false,"containers_before_supabase":0}\n' >"$root/pre-start-proof.json"
+printf '{"status":"PASS","denied_before_create":["ipv4-wildcard","ipv4-non-loopback","ipv6-wildcard","host-network"],"denied_state_bind_attempts":6,"read_only_sql_bind_canary":true,"published_canary":"127.0.0.1","outer_ipv4_reachable":false,"outer_ipv6_reachable":false,"tap_ipv4_reachable":false,"containers_before_supabase":0}\n' >"$root/pre-start-proof.json"
 chmod 0444 "$root/pre-start-proof.json"
-printf 'Pre-start Docker policy verified against four unsafe requests and one live loopback canary.\n'
+printf 'Pre-start Docker policy verified against ten unsafe requests and one live loopback canary with a read-only SQL bind.\n'
 stage=service-startup
 rc=0
 user_phase start || rc=$?
@@ -416,9 +456,4 @@ if (( rc == 0 )); then
   fi
 fi
 if ! user_phase cleanup; then rc=1; fi
-# CLI cleanup must leave no containers, including ones from interrupted startup.
-if ! empty_containers; then
-  printf 'Private stack container cleanup could not be verified.\n' >&2
-  rc=1
-fi
 exit "$rc"

@@ -76,6 +76,9 @@ jobs:
         working-directory: workspace
         run: node --test scripts/ci-docker-admission.test.mjs scripts/verify-disposable-docker-bindings.test.mjs
 
+      - name: Validate Docker state isolation and cleanup
+        run: node --test scripts/ci-docker-state-isolation.test.mjs
+
       - name: Prove isolation and run the pinned messaging candidate
         shell: bash
         timeout-minutes: 75
@@ -116,5 +119,6 @@ jobs:
             workspace/test-artifacts/docker-network-summary.json
             workspace/test-artifacts/docker-network-cleanup-summary.json
             workspace/test-artifacts/docker-stop-summary.json
+            workspace/test-artifacts/docker-teardown-summary.json
           if-no-files-found: warn
           retention-days: 7

@@ -1,4 +1,4 @@
-import { chmodSync, realpathSync } from "node:fs";
+import { chmodSync, lstatSync, realpathSync } from "node:fs";
 import { createServer } from "node:http";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -87,13 +87,15 @@ function allowedBind(value, policy) {
   )
     return false;
   if (/^supabase_[a-z0-9_-]+$/.test(source)) return source.endsWith("_" + policy.project);
-  if (!path.isAbsolute(source)) return false;
-  const canonical = realpathSync(source);
-  const projectPath = policy.workspace + "/supabase/";
-  const runtimePath = policy.root + "/state/";
+  // The pinned start command streams bootstrap files and uses named volumes.
+  // Only the trusted pg_prove phase needs a host bind in this workflow.
+  const tests = path.join(policy.workspace, "supabase", "tests");
   return (
-    (canonical.startsWith(projectPath) && mode === "ro") ||
-    (canonical.startsWith(runtimePath) && !canonical.endsWith(".sock"))
+    source === tests &&
+    destination === "/tests" &&
+    mode === "ro" &&
+    realpathSync(source) === source &&
+    lstatSync(source).isDirectory()
   );
 }
 

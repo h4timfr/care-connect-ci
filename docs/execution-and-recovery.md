@@ -15,6 +15,8 @@
 
 Confirm the reported workflow, candidate, test patch, and supervisor identities. Require the filesystem proof, admission evidence, and loopback canary before startup. Check the verified service bindings, egress removal, and candidate activation. The expected inventory is 46 canonical migrations, 25 pgTAP files with 609 planned assertions, nine booking concurrency scenarios, and four browser workflows. The clinic case keeps its 120-second budget. Review direct socket delivery and reconnection alongside the browser tests. A healthy anonymous subscription may receive a row-free denial envelope, and must receive zero row events and have no access to the target rows. Require cleanup verification as part of accepting the run.
 
+Require a passing network cleanup summary and teardown summary. A missing, malformed, or mismatched ownership record fails the run. The supervisor independently verifies zero containers and volumes and only the built-in Docker networks before stopping the private units. It then checks the unit states, namespace removal, and removal of run-owned filesystem state.
+
 ## Recover from a blocked or failed run
 
 Use only the allowlisted diagnostics and startup, test, and cleanup summaries. Exit 78 identifies a failed prerequisite or isolation check. If retrieval failed, check that the exact commit is published and accessible anonymously. If the filesystem proof or network gates failed, investigate the named phase before authorizing another run. The supervisor uses run-owned resources and handles normal exit, test failure, and cancellation signals. Forced termination may interrupt validation. Use the disposable runner's teardown evidence and keep application and hosted database resources outside recovery operations.

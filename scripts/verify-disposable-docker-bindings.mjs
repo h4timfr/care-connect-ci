@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { isIP } from "node:net";
 import { pathToFileURL } from "node:url";
@@ -34,7 +34,9 @@ function validName(value) {
 function writeEvidence(filename, evidence) {
   const outputPath = path.resolve(filename);
   mkdirSync(path.dirname(outputPath), { recursive: true });
-  writeFileSync(outputPath, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });
+  writeFileSync(outputPath, `${JSON.stringify(evidence, null, 2)}\n`, {
+    mode: 0o600,
+  });
 }
 
 function run(command, args, { allowFailure = false } = {}) {
@@ -313,7 +315,11 @@ async function createNetwork(name, runLabel, evidencePath, markerPath) {
 export function applyStartupOutcome(assessment, outcome) {
   if (outcome === "success") return assessment;
   if (["failure", "cancelled"].includes(outcome)) {
-    return { ...assessment, status: "NOT_EVALUATED", reason: "stack-unavailable" };
+    return {
+      ...assessment,
+      status: "NOT_EVALUATED",
+      reason: "stack-unavailable",
+    };
   }
   return { ...assessment, status: "FAIL", reason: "startup-outcome-unknown" };
 }
@@ -352,7 +358,10 @@ function verifyRuntime(name, configPath, evidencePath, runLabel, startupOutcome)
       { status: "FAIL", failure_codes: ["docker-runtime-inspection-failed"] },
       startupOutcome,
     );
-    writeEvidence(evidencePath, { stage: "docker-port-bindings-before-integration", ...result });
+    writeEvidence(evidencePath, {
+      stage: "docker-port-bindings-before-integration",
+      ...result,
+    });
     console.error(
       `Disposable Docker port-binding gate ${result.status} (sanitized inspection failure).`,
     );
@@ -360,105 +369,107 @@ function verifyRuntime(name, configPath, evidencePath, runLabel, startupOutcome)
   }
 }
 
-function cleanupNetwork(name, markerPath, evidencePath) {
+export function cleanupOwnedNetwork(
+  name,
+  runLabel,
+  markerPath,
+  { docker = (args) => run("docker", args).stdout, stat = lstatSync } = {},
+) {
+  const fail = (code) => ({
+    status: "FAIL",
+    network_removed: false,
+    failure_codes: [code],
+  });
   let marker;
   try {
+    const file = stat(markerPath);
+    if (
+      !file.isFile() ||
+      file.uid !== 0 ||
+      file.nlink !== 1 ||
+      file.size > 1024 ||
+      (file.mode & 0o222) !== 0
+    ) {
+      return fail("network-ownership-marker-invalid");
+    }
     marker = JSON.parse(readFileSync(markerPath, "utf8"));
-  } catch {
-    writeEvidence(evidencePath, {
-      status: "SKIPPED",
-      reason: "network-not-created-by-this-run",
-      network_removed: false,
-    });
-    console.log("Disposable Docker network cleanup skipped (no owned network marker).");
-    return;
+  } catch (error) {
+    return fail(
+      error.code === "ENOENT"
+        ? "network-ownership-marker-missing"
+        : "network-ownership-marker-invalid",
+    );
   }
+  if (
+    !validName(name) ||
+    !validName(runLabel) ||
+    marker?.name !== name ||
+    marker.run_label !== runLabel ||
+    !/^[a-f0-9]{64}$/.test(marker.id ?? "")
+  ) {
+    return fail("network-ownership-marker-invalid");
+  }
+
+  const inventory = () =>
+    docker(["network", "ls", "--format", "{{.Name}}"]).trim().split(/\r?\n/).filter(Boolean).sort();
   try {
+    if (docker(["ps", "--all", "--quiet"]).trim()) return fail("private-daemon-containers-remain");
+    const before = inventory();
+    const ownedPresent = before.includes(name);
     if (
-      marker.name !== name ||
-      !/^[a-f0-9]{64}$/i.test(marker.id) ||
-      !validName(marker.run_label)
+      before.join(",") !== (ownedPresent ? [name, "host", "none"].sort().join(",") : "host,none")
     ) {
-      throw new Error("network-ownership-marker-invalid");
+      return fail("unexpected-private-network-inventory");
     }
-    const listed = run("docker", [
-      "network",
-      "ls",
-      "--no-trunc",
-      "--filter",
-      `id=${marker.id}`,
-      "--format",
-      "{{.ID}}",
-    ])
-      .stdout.split(/\r?\n/)
-      .filter(Boolean);
-    if (listed.length === 0) {
-      writeEvidence(evidencePath, {
-        status: "PASS",
-        network_removed: true,
-        removed_by: "supabase-stop-or-prior-cleanup",
-        remaining_attached_containers: 0,
-      });
-      console.log("Disposable Docker network cleanup PASS (network already absent).");
-      return;
+    if (ownedPresent) {
+      const [network] = JSON.parse(docker(["network", "inspect", name]));
+      if (
+        network?.Name !== name ||
+        network.Id !== marker.id ||
+        network.Labels?.[workflowLabel] !== runLabel
+      ) {
+        return fail("network-ownership-mismatch");
+      }
+      if (Object.keys(network.Containers ?? {}).length)
+        return fail("owned-network-still-has-containers");
+      docker(["network", "rm", marker.id]);
     }
-    if (listed.length !== 1 || listed[0] !== marker.id) throw new Error("network-id-mismatch");
-    const network = inspectNetwork(marker.id);
-    if (
-      network.Name !== name ||
-      network.Id !== marker.id ||
-      network.Labels?.[workflowLabel] !== marker.run_label
-    ) {
-      throw new Error("network-ownership-mismatch");
-    }
-    const attached = Object.keys(network.Containers ?? {});
-    if (attached.length > 0) {
-      writeEvidence(evidencePath, {
-        status: "FAIL",
-        network_removed: false,
-        remaining_attached_containers: attached.length,
-        failure_codes: ["owned-network-still-has-containers"],
-      });
-      process.exitCode = 1;
-      return;
-    }
-    run("docker", ["network", "rm", marker.id]);
-    const remains = run("docker", [
-      "network",
-      "ls",
-      "--no-trunc",
-      "--filter",
-      `id=${marker.id}`,
-      "--format",
-      "{{.ID}}",
-    ])
-      .stdout.split(/\r?\n/)
-      .filter(Boolean);
-    if (remains.length > 0) throw new Error("network-removal-unverified");
-    writeEvidence(evidencePath, {
+    if (inventory().join(",") !== "host,none") return fail("network-removal-unverified");
+    if (docker(["ps", "--all", "--quiet"]).trim()) return fail("private-daemon-containers-remain");
+    return {
       status: "PASS",
       network_removed: true,
-      removed_by: "workflow",
+      removed_by: ownedPresent ? "workflow" : "supabase-stop-or-prior-cleanup",
       remaining_attached_containers: 0,
-    });
-    console.log("Disposable Docker network cleanup PASS.");
+    };
   } catch {
-    saveFailure(evidencePath, "owned-network-cleanup-failed");
+    return fail("owned-network-cleanup-failed");
+  }
+}
+
+function cleanupNetwork(name, markerPath, evidencePath, runLabel) {
+  const result = cleanupOwnedNetwork(name, runLabel, markerPath);
+  writeEvidence(evidencePath, result);
+  if (result.status !== "PASS") {
     console.error(
       "Disposable Docker network cleanup FAIL (sanitized ownership or engine failure).",
     );
     process.exitCode = 1;
+    return;
   }
+  console.log("Disposable Docker network cleanup PASS (independent engine inventory).");
 }
 
 const [mode, networkName, third, fourth, fifth, sixth] = process.argv.slice(2);
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   try {
     const owned = privateDockerIdentity(mode === "create" ? "provisioned" : "verified");
+    const ownedMarker = process.env.CARECONNECT_ISOLATION_ROOT + "/ownership/network.json";
     if (
       networkName !== owned.project ||
-      (mode === "create" && third !== owned.run) ||
-      (mode === "verify" && fifth !== owned.run)
+      (mode === "create" && (third !== owned.run || fifth !== ownedMarker)) ||
+      (mode === "verify" && fifth !== owned.run) ||
+      (mode === "cleanup" && (fifth !== owned.run || third !== ownedMarker))
     )
       throw new Error("network ownership mismatch");
   } catch (error) {
@@ -474,10 +485,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   } else if (mode === "verify") {
     verifyRuntime(networkName, third, fourth, fifth, sixth);
   } else if (mode === "cleanup") {
-    cleanupNetwork(networkName, third, fourth);
+    cleanupNetwork(networkName, third, fourth, fifth);
   } else {
     console.error(
-      "Usage: create <network> <run-label> <evidence> <marker> | verify <network> <config> <evidence> <run-label> <startup-outcome> | cleanup <network> <marker> <evidence>",
+      "Usage: create <network> <run-label> <evidence> <marker> | verify <network> <config> <evidence> <run-label> <startup-outcome> | cleanup <network> <marker> <evidence> <run-label>",
     );
     process.exitCode = 2;
   }

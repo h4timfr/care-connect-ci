@@ -6,7 +6,7 @@ umask 077
 
 network=$CARECONNECT_DOCKER_NETWORK
 run_label=$CARECONNECT_DOCKER_RUN_LABEL
-record="$RUNNER_TEMP/careconnect-docker-network-owned.json"
+record="$CARECONNECT_ISOLATION_ROOT/ownership/network.json"
 mkdir -p test-artifacts
 
 docker_bounded() { timeout --signal=TERM --kill-after=5s 20s docker "$@"; }
@@ -125,7 +125,15 @@ case "$1" in
     fi
     node -e 'require("fs").writeFileSync("test-artifacts/docker-stop-summary.json", JSON.stringify({status: process.argv[1]}) + "\n", {mode:0o600})' "$status"
     node scripts/verify-disposable-docker-bindings.mjs cleanup "$network" "$record" \
-      test-artifacts/docker-network-cleanup-summary.json || code=1
+      test-artifacts/docker-network-cleanup-summary.json "$run_label" || code=1
+    if (( code == 0 )); then
+      volumes=$(docker_bounded volume ls -q) || exit 1
+      while IFS= read -r volume; do
+        [[ -n "$volume" ]] || continue
+        [[ "$volume" =~ ^supabase_[a-z0-9_-]+_${network}$ ]] || exit 1
+        docker_bounded volume rm "$volume" >/dev/null 2>&1 || exit 1
+      done <<<"$volumes"
+    fi
     exit "$code"
     ;;
   *) exit 78 ;;

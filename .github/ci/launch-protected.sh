@@ -95,7 +95,8 @@ finish() {
       service-execution-boundary.json docker-pre-start-proof.json startup.log startup-process.json \
       startup-images-before.json startup-evidence.json startup-observer.json startup-observer-cleanup.json \
       ledger.log pgtap.log concurrency.log real-service-summary.json browser-workflow-summary.json \
-      browser-failure-trace.json docker-network-summary.json docker-network-cleanup-summary.json docker-stop-summary.json; do
+      browser-failure-trace.json docker-network-summary.json docker-network-cleanup-summary.json docker-stop-summary.json \
+      docker-teardown-summary.json; do
       input="$sealed/workspace/test-artifacts/$file"
       [[ -e "$input" || -L "$input" ]] || continue
       if [[ -f "$input" && ! -L "$input" && ! -L "$output/$file" &&
