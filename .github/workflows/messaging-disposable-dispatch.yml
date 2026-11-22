@@ -56,9 +56,37 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       - name: Install pinned Supabase CLI
-        uses: supabase/setup-cli@45a513f8c64c0bc8e0e3dfe572b5c95be85f6359 # v3.0.1
-        with:
-          version: 2.117.0
+        id: supabase_cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || exit 78
+          directory=$(mktemp -d "$RUNNER_TEMP/careconnect-supabase-cli.XXXXXXXX")
+          archive="$directory/supabase_2.117.0_linux_amd64.tar.gz"
+          binary="$directory/supabase"
+          trap 'rm -f -- "$archive"' EXIT
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time 120 --output "$archive" \
+            https://github.com/supabase/cli/releases/download/v2.117.0/supabase_2.117.0_linux_amd64.tar.gz
+          printf '%s  %s\n' 69c05f85b9e47ee706d30f1a6ca8a526b4e337bfd12c7ef1ef522d24e7280d24 "$archive" |
+            sha256sum --check --strict -
+          python3 - "$archive" "$binary" <<'PY'
+          import shutil
+          import sys
+          import tarfile
+
+          with tarfile.open(sys.argv[1], "r:gz") as archive:
+              executables = [member for member in archive.getmembers() if member.name == "supabase"]
+              if len(executables) != 1 or not executables[0].isfile():
+                  sys.exit("Expected a unique regular supabase archive member.")
+              with archive.extractfile(executables[0]) as source, open(sys.argv[2], "xb") as target:
+                  shutil.copyfileobj(source, target)
+          PY
+          printf '%s  %s\n' 40efbaffd04e4cbf501b4f29a52c88ca23f81c636ef211e3b255c4e7b81eeb01 "$binary" |
+            sha256sum --check --strict -
+          chmod 0555 "$binary"
+          printf 'binary=%s\n' "$binary" >> "$GITHUB_OUTPUT"
 
       - name: Install namespace, PostgreSQL, and Chromium system dependencies
         shell: bash
@@ -93,6 +121,7 @@ jobs:
         timeout-minutes: 75
         env:
           TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          SUPABASE_CLI_BINARY: ${{ steps.supabase_cli.outputs.binary }}
         run: |
           set -euo pipefail
           [[ "$(/usr/bin/git rev-parse HEAD)" == "$TRUSTED_WORKFLOW_SHA" ]] || exit 78
@@ -215,7 +244,7 @@ jobs:
               "CI_OWNER=$GITHUB_ACTOR" "CI_TRIGGER=$GITHUB_TRIGGERING_ACTOR" \
               /bin/bash --noprofile --norc -c "$bootstrap" careconnect \
                 "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" "$(pwd -P)" \
-                "$(command -v node)" "$(command -v supabase)" "$RUNNER_TEMP/careconnect-chromium"
+                "$(command -v node)" "$SUPABASE_CLI_BINARY" "$RUNNER_TEMP/careconnect-chromium"
 
       - name: Upload sanitized integration evidence
         if: always()
